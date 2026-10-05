@@ -1,0 +1,12 @@
+.DS_Store
+.Rhistory
+.RData
+.Ruserdata
+.Renviron
+.Rproj.user/
+*_cache/
+*_files/
+*.html
+*.csv
+*.rds
+outputs/

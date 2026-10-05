@@ -1,0 +1,1901 @@
+---
+title: "Zoe Thesis Analysis Code"
+author: "Zoe Klotz"
+date: "2026-03-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#load packages
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(fixest)
+
+getwd()
+#insert your own working directory 
+setwd("/Users/zo/Desktop/MAthesis_data")
+
+#load data
+Hospital_ER_DF <- read_csv("Hospital_Emergency_Department_Discharges_(SPARCS_De-Identified)__Potentially_Preventable_Emergency_Visit_(PPV)_Rates_by_Patient_Zip_Code__Beginning_2011_20260322.csv")
+
+#view
+glimpse(Hospital_ER_DF)
+names(Hospital_ER_DF)
+
+#Filter out non-NYC variables from Panel 
+panel <- Hospital_ER_DF %>%
+  filter(grepl("^[0-9]+$", `Patient Zipcode`)) %>%
+  mutate(`Patient Zipcode` = sprintf("%05d", as.numeric(`Patient Zipcode`))) %>%
+  filter(
+    substr(`Patient Zipcode`, 1, 3) %in% c(
+      "100", "101", "102", "103", "104",
+      "111", "112", "113", "114", "116"
+    )
+  ) %>%
+  filter(!is.na(`Risk Adjusted Rate Per 100 People`)) %>%
+  rename(ppv_rate = `Risk Adjusted Rate Per 100 People`)
+
+#see zip codes in panel (check to make sure it filtered correctly)
+unique(panel$`Patient Zipcode`)
+
+#set treated zipcode- UES (add 10044 to include Roosevelt Island)
+treated_zips <- c("10021", "10028", "10128")
+
+#for robustness checks later
+treated_zips_ext <- c("10021", "10028", "10128", "10044")
+
+
+```
+
+
+```{r exploratory-comparison-treatment-groups-compared-to-all-Manhattan}
+
+# Get mean pre-2017 PPV by Manhattan ZIP
+baseline_candidates <- panel %>%
+  filter(`Discharge Year` < 2017) %>%
+  filter(substr(`Patient Zipcode`, 1, 3) == "100" | `Patient Zipcode` == "10128") %>%
+  group_by(`Patient Zipcode`) %>%
+  summarise(mean_ppv = mean(ppv_rate, na.rm = TRUE), .groups = "drop") %>%
+  mutate(group = ifelse(`Patient Zipcode` %in% treated_zips, "Treated", "Control"))
+
+baseline_candidates
+
+# Visualize treated vs all other Manhattan ZIPs
+ggplot(baseline_candidates, aes(x = group, y = mean_ppv)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1) +
+  labs(
+    title = "Baseline Mean PPV: Treated ZIPs vs All Manhattan ZIPs",
+    x = "",
+    y = "Mean PPV (Pre-2017)"
+  )
+```
+```{r find-zipcodes-for-control}
+# Compute baseline pre-treatment PPV for Manhattan candidate ZIPs
+baseline <- panel %>%
+  filter(`Discharge Year` < 2017) %>%
+  filter(substr(`Patient Zipcode`, 1, 3) == "100" | `Patient Zipcode` == "10128") %>%
+  group_by(`Patient Zipcode`) %>%
+  summarise(mean_ppv = mean(ppv_rate, na.rm = TRUE), .groups = "drop")
+
+# Visualize all Manhattan ZIPs with treated ZIPs marked in red
+ggplot(baseline, aes(x = mean_ppv)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  geom_vline(
+    data = baseline %>% filter(`Patient Zipcode` %in% treated_zips),
+    aes(xintercept = mean_ppv),
+    color = "red",
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Baseline PPV Distribution (Manhattan ZIPs)",
+    x = "Mean PPV (Pre-2017)",
+    y = "Count"
+  )
+
+# Visualize ZIP-level baseline PPV with labels
+ggplot(baseline, aes(x = mean_ppv, y = reorder(`Patient Zipcode`, mean_ppv))) +
+  geom_point() +
+  geom_vline(
+    data = baseline %>% filter(`Patient Zipcode` %in% treated_zips),
+    aes(xintercept = mean_ppv),
+    color = "red"
+  ) +
+  labs(
+    title = "Baseline PPV by ZIP",
+    x = "Mean PPV (Pre-2017)",
+    y = "ZIP Code"
+  )
+
+# Based on these graphs, define matched controls using overlapping baseline PPV range
+matched_controls <- baseline %>%
+  filter(mean_ppv >= 11 & mean_ppv <= 14.5) %>%
+  pull(`Patient Zipcode`) %>%
+  setdiff(treated_zips)
+
+# Print matched control ZIPs
+matched_controls
+
+# Table of treated and matched control ZIPs
+comparison_tbl <- baseline %>%
+  filter(`Patient Zipcode` %in% c(treated_zips, matched_controls)) %>%
+  mutate(
+    group = ifelse(`Patient Zipcode` %in% treated_zips, "Treated", "Control")
+  ) %>%
+  arrange(group, mean_ppv)
+
+comparison_tbl
+
+# Build final analysis dataframe
+analysis_df <- panel %>%
+  filter(`Patient Zipcode` %in% c(treated_zips, matched_controls)) %>%
+  mutate(
+    treated = ifelse(`Patient Zipcode` %in% treated_zips, 1, 0),
+    group = ifelse(treated == 1, "Treated", "Control")
+  )
+```
+
+comparison-between-treatment-and-control groups
+```{r comparison-between-treatment-and-control groups}
+
+comparison_tbl
+
+# Box-and-whisker plot comparing treated and matched control ZIPs
+ggplot(comparison_tbl, aes(x = group, y = mean_ppv)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.08, size = 2) +
+  geom_text(aes(label = `Patient Zipcode`), hjust = -0.15, size = 3) +
+  labs(
+    title = "Baseline Mean PPV by Group",
+    x = "",
+    y = "Mean PPV (Pre-2017)"
+  ) +
+  coord_flip()
+
+
+```
+parallel-trend-analysis
+```{r parallel-trend-analysis}
+
+#visual analysis
+trend <- analysis_df %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, group) %>%
+  summarise(mean_ppv = mean(`ppv_rate`), .groups = "drop")
+
+ggplot(trend, aes(x = `Discharge Year`, y = mean_ppv, color = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point() +
+  labs(
+    title = "Pre-Treatment Trends (Parallel trends check)"
+  )
+```
+formal-pretrend-test
+```{r formal-pretrend-test}
+
+pre_model <- feols(
+  ppv_rate ~ treated * factor(`Discharge Year`) | `Patient Zipcode`,
+  data = analysis_df %>% filter(`Discharge Year` < 2017),
+  cluster = ~`Patient Zipcode`
+)
+
+summary(pre_model)
+
+#tidy, make exportable
+library(broom)
+trendtest <- tidy(pre_model)
+
+#export to csv
+write_csv(trendtest, "paralleltrendtest.csv")
+
+#export table as html (optional)
+
+#etable(
+#  pre_model,
+#  dict = c(
+#    "factor(`Discharge Year`)2012" = "2012",
+#    "factor(`Discharge Year`)2013" = "2013",
+#    "factor(`Discharge Year`)2014" = "2014",
+#    "factor(`Discharge Year`)2015" = "2015",
+#    "factor(`Discharge Year`)2016" = "2016",
+#    "treated:factor(`Discharge Year`)2012" = "Treated × 2012",
+#    "treated:factor(`Discharge Year`)2013" = "Treated × 2013",
+#    "treated:factor(`Discharge Year`)2014" = "Treated × 2014",
+#    "treated:factor(`Discharge Year`)2015" = "Treated × 2015",
+#    "treated:factor(`Discharge Year`)2016" = "Treated × 2016"
+#  ),
+#  file = "parallel_trend_test_pretty.html")
+
+```
+
+```{r preDiD-summarystats}
+#Summary statistics
+#overall average of both control and treatment groups 
+
+overallavg <- analysis_df %>%
+  summarise(
+    mean_ppv = mean(ppv_rate, na.rm = TRUE),
+    sd_ppv = sd(ppv_rate, na.rm = TRUE),
+    min_ppv = min(ppv_rate, na.rm = TRUE),
+    max_ppv = max(ppv_rate, na.rm = TRUE),
+    n = n()
+  )
+
+overallavg
+
+#control vs treated 
+
+PreDiDsummary <- analysis_df %>%
+  group_by(group) %>%
+  summarise(
+    mean_ppv = mean(ppv_rate, na.rm = TRUE),
+    sd_ppv = sd(ppv_rate, na.rm = TRUE),
+    min_ppv = min(ppv_rate, na.rm = TRUE),
+    max_ppv = max(ppv_rate, na.rm = TRUE),
+    n = n()
+  )
+
+PreDiDsummary
+
+```
+
+```{r DiD}
+#Run DiD models
+#prep /make sure it's clean  
+analysis_df <- analysis_df %>%
+  mutate(
+    post = ifelse(`Discharge Year` >= 2017, 1, 0),
+    ppv_rate = ppv_rate
+  )
+
+# 2-way fixed effect model 
+did_model <- feols(
+  ppv_rate ~ treated * post | `Patient Zipcode` + `Discharge Year`,
+  data = analysis_df,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(did_model)
+
+#run event model
+event_model <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_df,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(event_model)
+iplot(event_model)
+
+```
+
+```{r sun-abraham}
+#create treatment year if not there already
+analysis_dfSuA <- analysis_df %>%
+  mutate(
+    treat_year = ifelse(treated == 1, 2017, 0)
+  )
+
+#run sun-abraham model
+sa_model <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_dfSuA,
+  cluster = ~`Patient Zipcode`
+)
+
+#results
+summary(sa_model)
+
+#plot
+iplot(
+  sa_model,
+  main = "Sun-Abraham Event Study",
+  xlab = "Event Time",
+  ylab = "Effect on Risk-Adjusted PPV Rate"
+)
+
+```
+```{r no2020plus}
+#regualr DiD
+#testing to try and see how Covid plays in 
+analysis_pre_covid <- analysis_df %>%
+  filter(`Discharge Year` <= 2019)
+
+
+did_pre_covid <- feols(
+  ppv_rate ~ treated * post | `Patient Zipcode` + `Discharge Year`,
+  data = analysis_pre_covid,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(did_pre_covid)
+#lowers effect, but does not disappear completely
+
+#sunab event study no covid
+#re-add treat_year
+analysis_pre_covid <- analysis_pre_covid %>%
+  mutate(
+    treat_year = ifelse(treated == 1, 2017, 0)
+  )
+
+sa_pre_covid <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_pre_covid,
+  cluster = ~`Patient Zipcode`
+)
+
+
+summary(sa_pre_covid)
+
+iplot(
+  sa_pre_covid,
+  main = "No COVID: Sun-Abraham Event Study",
+  xlab = "Event Time",
+  ylab = "Effect on Risk-Adjusted PPV Rate"
+)
+
+
+```
+
+
+
+
+
+
+
+
+
+alternative control method
+```{r pretrend-match-slopeandmean}
+
+#zip trends- calculate trend slope per zip (eg. the parallel trends graph)
+zip_trends <- analysis_df %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Patient Zipcode`) %>%
+  summarise(
+    slope = coef(lm(ppv_rate ~ `Discharge Year`))[2],
+    mean_ppv = mean(ppv_rate),
+    .groups = "drop"
+  )
+
+treated_profile <- zip_trends %>%
+  filter(`Patient Zipcode` %in% treated_zips)
+
+treated_slope <- mean(treated_profile$slope)
+treated_mean  <- mean(treated_profile$mean_ppv)
+
+#pull the zips closest to the treatment zips in both slope and mean ppv
+matched_controls <- zip_trends %>%
+  filter(!`Patient Zipcode` %in% treated_zips) %>%
+  mutate(
+    dist = sqrt(
+      (mean_ppv - treated_mean)^2 +
+      (slope - treated_slope)^2
+    )
+  ) %>%
+  arrange(dist) %>%
+  slice(1:5) %>%
+  pull(`Patient Zipcode`)
+
+matched_controls
+
+#rebuild analysis dataframe only including these zips
+analysis_df2 <- panel %>%
+  filter(`Patient Zipcode` %in% c(treated_zips, matched_controls)) %>%
+  mutate(
+    treated = ifelse(`Patient Zipcode` %in% treated_zips, 1, 0),
+    group = ifelse(treated == 1, "Treated", "Control")
+  )
+
+trend2 <- analysis_df2 %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, group) %>%
+  summarise(mean_ppv = mean(`ppv_rate`), .groups = "drop")
+
+ggplot(trend2, aes(x = `Discharge Year`, y = mean_ppv, color = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point() +
+  labs(
+    title = "Pre-Treatment Trends (Parallel trends check)"
+  )
+
+
+#somehow this graph is way worse with the algorithmically selected controls than the one's selected based on range
+
+#table
+pre_model2 <- feols(
+  ppv_rate ~ treated * factor(`Discharge Year`) | `Patient Zipcode`,
+  data = analysis_df2 %>% filter(`Discharge Year` < 2017),
+  cluster = ~`Patient Zipcode`
+)
+
+summary(pre_model)
+
+
+```
+
+
+-----------------
+
+STUDY 2- PPV across non-UES Q line (Effect of increased access to UES resources) 
+
+
+```{r addcensusdata}
+#Get ACS data
+#install and load tidycensus package
+library(tidycensus)
+library(dplyr)
+library(purrr)
+library(tidyr)
+
+# set your Census API key (only once ever)
+## API key required to reproduce API calls.
+#Go to https://www.census.gov/data/developers/data-sets/acs-5year.html to request a key 
+census_api_key("[YOUR CENSUS API KEY HERE]", install = TRUE)
+
+#Define variables
+vars <- c(
+  income = "B19013_001",          # median household income
+  poverty_n = "B17001_002",       # number below poverty
+  poverty_denom = "B17001_001",   # poverty denominator
+  total_pop = "B03002_001",       #race table total pop
+  white_nh = "B03002_003",
+  black_nh = "B03002_004",
+  asian_nh = "B03002_006",
+  hispanic = "B03002_012",
+
+#education (another measure of gentrification)
+  male_ba       = "B15002_015",
+  male_masters  = "B15002_016",
+  male_prof     = "B15002_017",
+  male_doctoral = "B15002_018",
+
+  female_ba       = "B15002_032",
+  female_masters  = "B15002_033",
+  female_prof     = "B15002_034",
+  female_doctoral = "B15002_035",
+  edu_total = "B15002_001"
+)
+
+#Pull ACS 5-year estimates for years 2011 - 2022
+years <- 2011:2022
+
+#Get data from tables: BEWARE TAKES LONG TIME
+acs_raw <- map_dfr(years, function(y) {
+  get_acs(
+    geography = "zcta",
+    variables = vars,
+    year = y,
+    survey = "acs5"
+  ) %>% 
+    mutate(year = y)
+})
+
+#filter to NYC zip codes
+acs_raw <- acs_raw %>%
+  mutate(zcta = substr(GEOID, nchar(GEOID) - 4, nchar(GEOID))) %>%
+  filter(substr(zcta, 1, 3) %in% c(
+    "100","101","102","103","104","111","112","113","114","116"
+  ))
+
+#reshape table to wide
+acs_wide <- acs_raw %>%
+  select(GEOID, year, variable, estimate) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = estimate
+  )
+
+#create clean ZCTA field
+acs_wide <- acs_wide %>%
+  mutate(zcta = substr(GEOID, nchar(GEOID) - 4, nchar(GEOID)))
+
+#build ACS clean to add back to analysis: add college educated percentage and poverty rate
+acs_clean <- acs_wide %>%
+  mutate(
+    poverty_rate = poverty_n / poverty_denom,
+    college_educated = (male_ba + male_masters + male_prof + male_doctoral + female_ba + female_masters + female_prof + female_doctoral) / edu_total,             pct_white = white_nh / total_pop,
+    pct_black = black_nh / total_pop,
+    pct_hispanic = hispanic / total_pop) %>%
+  select(
+    zcta,
+    year,
+    income,
+    poverty_rate,
+    total_pop,
+    college_educated, 
+    pct_white, 
+    pct_black, 
+    pct_hispanic
+  )
+
+#view rows with NA data
+acs_clean %>%
+  filter(
+    is.na(income) |
+    is.na(poverty_rate) |
+    is.na(total_pop) |
+    is.na(college_educated)
+  )
+
+#and first 5 rows of full table
+head(acs_clean)
+
+
+```
+
+
+Load in train lines + join with zctas, export train dataset w/ZCTAs
+```{r extractZIPsfromTrains}
+
+library(dplyr)
+library(sf)
+library(stringr)
+library(tidyverse)
+
+#Load MTA list (saved locally, downloaded from Open NYC data
+subway_lines <- read_csv("~/Downloads/MTA_Subway_Stations_20251109.csv")
+
+#isolate Q stops and set CRS
+q_stops <- subway_lines %>%
+  filter(str_detect(`Daytime Routes`, "Q")) %>%
+  st_as_sf(coords = c("GTFS Longitude", "GTFS Latitude"), crs = 4326)
+
+#load modZCTA
+ZCTA_file <- read_csv("~/Desktop/MAthesis_data/Modified_Zip_Code_Tabulation_Areas_(MODZCTA)_20260329.csv")
+
+#convert zcta to sf file
+zcta_sf <- st_as_sf(ZCTA_file, wkt = "the_geom", crs = 4326)
+
+#print(zcta_sf)
+plot(st_geometry(zcta_sf))
+
+#join trains + sf_ZCTA
+q_with_zip <- st_join(q_stops, zcta_sf)
+
+
+write_csv(q_with_zip, "Q_ZCTA.csv")
+
+```
+
+
+
+
+NAs in ACS dataset- dealing with missingness, looking at clustering 
+
+```{r acsMissingness}
+
+#identify where NAs exist in the dataset
+acs_clean %>%
+  summarise(across(everything(), ~mean(is.na(.))))
+
+
+#How many per year? Are they concentrated in a single set of years or consistent across the timeframe? 
+acs_clean %>%
+  filter(
+    is.na(income) |
+    is.na(poverty_rate) |
+    is.na(college_educated) |
+    is.na(pct_black)
+  ) %>%
+  count(year)
+
+#are they clustered geographically? 
+acs_clean %>%
+  filter(is.na(income) |
+    is.na(poverty_rate) |
+    is.na(college_educated) |
+    is.na(pct_black)) %>%
+  count(zcta)
+
+#compare NA and non-NA rows
+acs_clean %>%
+  mutate(has_na = if_any(everything(), is.na)) %>%
+  group_by(has_na) %>%
+  summarise(
+    mean_income = mean(income, na.rm = TRUE),
+    mean_college = mean(college_educated, na.rm = TRUE),
+    mean_black = mean(pct_black, na.rm = TRUE),
+    n = n()
+  )
+
+#has_na rows always have mean income as a missing value; when NAs were removed from the dataset, there was nothing to average in the mean income column for the rows that had missing data. 
+
+#which zctas is it? 
+acs_clean %>%
+  filter(is.na(income)) %>%
+  distinct(zcta)
+
+```
+
+
+
+```{r MissingnessMap}
+
+#create frame of missing incomes zctas and change zcta to character
+
+acs_map <- acs_clean %>%
+  mutate(missing_income = is.na(income)) %>% #create "missing income" binary column 
+  mutate(zcta = as.character(zcta))
+
+#join to modzcta, change zcta to character
+zcta_map <- zcta_sf %>%
+  mutate(MODZCTA = as.character(MODZCTA)) %>% 
+  left_join(acs_map, by = c("MODZCTA" = "zcta"))
+
+
+#check the data
+#zcta_map$MODZCTA
+
+sum(is.na(zcta_map$income))
+nrow(zcta_map)
+
+length(unique(zcta_sf$MODZCTA))
+length(unique(acs_map$zcta))
+
+intersect(
+  unique(zcta_sf$MODZCTA),
+  unique(acs_map$zcta)
+) %>% length()
+
+
+#extract ZIP codes that exist in the spatial dataset but do not exist in the ACS dataset
+setdiff(unique(zcta_sf$MODZCTA), unique(acs_map$zcta))
+
+
+
+
+
+
+```
+
+
+```{r NAMap}
+
+#create map of NAs
+#collapse zcta_map to one row per zip
+zcta_na_map <- zcta_map %>%
+  group_by(MODZCTA) %>%
+  summarise(
+    missing_income = all(is.na(income)),
+    geometry = first(the_geom)
+  ) %>%
+  ungroup()
+
+#plot
+library(ggplot2)
+
+ggplot(zcta_na_map) +
+  geom_sf(aes(fill = missing_income), color = "white", linewidth = 0.2) +
+  scale_fill_manual(
+    values = c("FALSE" = "lightblue", "TRUE" = "red"),
+    name = "Missing Income"
+  ) +
+  labs(
+    title = "ZIP Codes with Missing Income Data (ACS)",
+    subtitle = "Red = no income data across all years"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r gentrification-def}
+                                                                                                            
+#define pre- and post-treatment years
+pre_years <- 2011:2016
+post_years <- 2017:2022
+
+#compute pre- and post-treatment income/education/poverty averages for each ZCTA
+acs_summary <- acs_clean %>%
+  group_by(zcta) %>%
+  summarise(
+    income_pre = mean(income[year %in% pre_years], na.rm = TRUE),
+    income_post = mean(income[year %in% post_years], na.rm = TRUE),
+
+    college_pre = mean(college_educated[year %in% pre_years], na.rm = TRUE),
+    college_post = mean(college_educated[year %in% post_years], na.rm = TRUE),
+
+    poverty_pre = mean(poverty_rate[year %in% pre_years], na.rm = TRUE),
+    poverty_post = mean(poverty_rate[year %in% post_years], na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+#compute change over time
+acs_summary <- acs_summary %>%
+  mutate(
+    d_income = income_post - income_pre,
+    d_college = college_post - college_pre,
+    d_poverty = poverty_post - poverty_pre
+  )
+
+#compute NYC average change
+nyc_change <- acs_clean %>%
+  summarise(
+    income_pre = mean(income[year %in% pre_years], na.rm = TRUE),
+    income_post = mean(income[year %in% post_years], na.rm = TRUE),
+
+    college_pre = mean(college_educated[year %in% pre_years], na.rm = TRUE),
+    college_post = mean(college_educated[year %in% post_years], na.rm = TRUE),
+
+    poverty_pre = mean(poverty_rate[year %in% pre_years], na.rm = TRUE),
+    poverty_post = mean(poverty_rate[year %in% post_years], na.rm = TRUE)
+  ) %>%
+  mutate(
+    d_income_nyc = income_post - income_pre,
+    d_college_nyc = college_post - college_pre,
+    d_poverty_nyc = poverty_post - poverty_pre
+  )
+
+#compute change relative to NYC average
+acs_summary <- acs_summary %>%
+  mutate(
+    rel_income = d_income - nyc_change$d_income_nyc,
+    rel_college = d_college - nyc_change$d_college_nyc,
+    rel_poverty = d_poverty - nyc_change$d_poverty_nyc
+  )
+
+#create relative gentrification index
+acs_summary <- acs_summary %>%
+  mutate(
+    gentrification_index =
+      scale(rel_income)[,1] +
+      scale(rel_college)[,1] -
+      scale(rel_poverty)[,1]
+  )
+
+        
+acs_summary
+
+#write.csv(acs_summary, "/Users/zo/Desktop/MAthesis_data/ACS_Gentscored_414.csv")
+
+
+```
+
+```{r define-intervention-area}
+
+#note: NOT treatment zips. zips directly exposed to new infrastructure
+
+# direct exposure ZIPs = ZIPs within 1 km of the new UES stations
+
+ues_stops <- q_stops %>%
+  filter(`Stop Name` %in% c("72 St", "86 St", "96 St"))
+
+# project for distance/buffer work
+ues_stops_proj <- st_transform(ues_stops, 6539)
+zcta_sf_proj <- st_transform(zcta_sf, 6539)
+
+# 1 km buffer around new stations
+exp_q_buffer <- st_buffer(ues_stops_proj, dist = 1000) #1 km
+
+# ZIPs intersecting the direct exposure zone
+exp_q_zips_clean <- zcta_sf_proj[
+  lengths(st_intersects(zcta_sf_proj, exp_q_buffer)) > 0,
+]
+
+direct_exposure_zips <- exp_q_zips_clean %>%
+  st_drop_geometry() %>%
+  pull(MODZCTA) %>%
+  as.character() %>%
+  unique() %>%
+  sort()
+
+#drop placeholdr zip 9999999
+direct_exposure_zips <- direct_exposure_zips[direct_exposure_zips != "99999"]
+
+direct_exposure_zips
+length(direct_exposure_zips)
+
+
+```
+
+
+```{r}
+# define full Q-corridor ZIP universe
+# this is NOT yet the final treatment group
+
+library(sf)
+library(dplyr)
+
+# project to a CRS with linear units for buffer calculations
+q_stops_proj <- st_transform(q_stops, 2263)
+zcta_sf_proj <- st_transform(zcta_sf, 2263)
+
+# create 1 km buffer around all Q stops
+q_corridor_buffer <- st_buffer(q_stops_proj, dist = 1500) #expanded to 1.5 km
+
+# keep ZIPs that intersect the Q corridor buffer
+q_corridor_zips <- zcta_sf_proj[
+  lengths(st_intersects(zcta_sf_proj, q_corridor_buffer)) > 0,
+]
+
+# extract ZIP IDs
+q_corridor_zip_ids <- q_corridor_zips %>%
+  st_drop_geometry() %>%
+  pull(MODZCTA) %>%
+  as.character() %>%
+  unique() %>%
+  sort()
+
+# drop placeholder ZIP
+q_corridor_zip_ids <- q_corridor_zip_ids[q_corridor_zip_ids != "99999"]
+
+# inspect
+q_corridor_zip_ids
+length(q_corridor_zip_ids)
+
+
+```
+ZIPS 
+
+Manhattan (100xx & 10128)
+10001 — Chelsea / Hudson Yards
+10002 — Lower East Side
+10003 — East Village / Union Square
+10007 — Tribeca / Civic Center
+10010 — Gramercy / Flatiron
+10011 — Chelsea / Meatpacking District
+10012 — SoHo / NoHo
+10013 — Tribeca / Chinatown
+10016 — Murray Hill / Kips Bay
+10018 — Garment District / Midtown South
+10019 — Midtown West
+10021 — Upper East Side
+10022 — Midtown East
+10023 — Upper West Side
+10028 — Upper East Side
+10029 — East Harlem
+10036 — Midtown / Times Square
+10038 — Financial District
+10065 — Upper East Side (Lenox Hill)
+10075 — Upper East Side
+10128 — Upper East Side (Carnegie Hill)
+Brooklyn (112xx)
+11201 — Brooklyn Heights / Downtown Brooklyn
+11205 — Clinton Hill / Fort Greene
+11210 — Flatbush / Midwood
+11215 — Park Slope / Gowanus
+11217 — Boerum Hill / Fort Greene
+11218 — Kensington / Windsor Terrace
+11223 — Gravesend
+11224 — Coney Island
+11225 — Crown Heights
+11226 — Flatbush
+11229 — Sheepshead Bay
+11230 — Midwood
+11235 — Brighton Beach
+11238 — Prospect Heights / Clinton Hill
+
+
+```{r matching-dfbuild}
+#remove ues zips and determine treatment zips
+#match treatment to control on gentrification scale pre and post-treatment years + match on income
+
+#remove UES zips
+treatment_zips <- q_corridor_zip_ids[
+  !q_corridor_zip_ids %in% c("10021", "10028", "10029", "10065", "10128")
+]
+
+#view zips + num of zips
+treatment_zips
+length(treatment_zips)
+
+# Build ZIP-level matching dataset from acs_summary, excluding UES zips, excluding NAs
+
+match_df <- acs_summary %>%
+  mutate(
+    zcta = as.character(zcta),
+    treated = ifelse(zcta %in% treatment_zips, 1, 0)
+  ) %>%
+  filter(
+    !zcta %in% c("10021", "10028", "10029", "10065", "10128")
+  ) %>%
+  select(
+    zcta,
+    treated,
+    income_pre,
+    income_post,
+    gentrification_index
+  ) %>%
+  filter(
+    !is.na(income_pre),
+    !is.na(income_post),
+    !is.na(gentrification_index)
+  )
+
+match_df
+
+#num of treated vs not
+table(match_df$treated)
+
+```
+
+
+```{r matching-process}
+
+library(MatchIt)
+
+# Run matching
+# start simple: nearest-neighbor on pre/post income + gentrification
+m.out <- matchit(
+  treated ~ income_pre + income_post + gentrification_index,
+  data = match_df,
+  method = "nearest",
+  ratio = 1, 
+  verbose = TRUE
+)
+
+summary(m.out)
+
+#created matched dataset
+matched_data <- match.data(m.out)
+
+matched_data %>%
+  count(treated) %>% 
+  print()
+
+```
+
+
+```{r check-matching}
+
+#compare match df to matched data; see how close control and treatment groups are after matchit
+
+match_dfsum <- match_df %>%
+  group_by(treated) %>%
+  summarise(
+    n = n(),
+    mean_income_pre = mean(income_pre, na.rm = TRUE),
+    mean_income_post = mean(income_post, na.rm = TRUE),
+    mean_gentrification = mean(gentrification_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+#before
+match_dfsum
+
+
+matched_datasum <- matched_data %>%
+  group_by(treated) %>%
+  summarise(
+    n = n(),
+    mean_income_pre = mean(income_pre, na.rm = TRUE),
+    mean_income_post = mean(income_post, na.rm = TRUE),
+    mean_gentrification = mean(gentrification_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+#and after
+matched_datasum
+
+
+
+```
+
+
+
+
+
+
+```{r extract-matched-zips}
+# Extract matched ZIPs
+
+matched_data <- match.data(m.out)
+
+matched_treatment_zips <- matched_data %>%
+  filter(treated == 1) %>%
+  pull(zcta) %>%
+  unique()
+
+matched_control_zips <- matched_data %>%
+  filter(treated == 0) %>%
+  pull(zcta) %>%
+  unique()
+
+matched_treatment_zips
+matched_control_zips
+
+length(matched_treatment_zips)
+length(matched_control_zips)
+
+
+
+```
+Build map of treatment and control zips
+```{r zips_map}
+#build map based on these zips (above)
+
+
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+matched_treatment_zips <- as.character(matched_treatment_zips)
+matched_control_zips   <- as.character(matched_control_zips)
+
+#map it
+map_df <- zcta_sf %>%
+  mutate(MODZCTA = as.character(MODZCTA)) %>%
+  mutate(
+    group = case_when(
+      MODZCTA %in% matched_treatment_zips ~ "Treatment",
+      MODZCTA %in% matched_control_zips ~ "Control",
+      TRUE ~ "Other"
+    )
+  )
+
+ggplot(map_df) +
+  geom_sf(aes(fill = group), color = "white", linewidth = 0.15) +
+  labs(
+    title = "Matched Treatment and Control ZIP Codes",
+    subtitle = "Study 2 sample in NYC context",
+    fill = "Group"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r build-panel}
+
+#build panel
+
+panel <- panel %>%
+  mutate(`Patient Zipcode` = as.character(`Patient Zipcode`))
+
+matched_treatment_zips <- as.character(matched_treatment_zips)
+matched_control_zips <- as.character(matched_control_zips)
+
+analysis_study2 <- panel %>%
+  filter(`Patient Zipcode` %in% c(matched_treatment_zips, matched_control_zips)) %>%
+  mutate(
+    treated = ifelse(`Patient Zipcode` %in% matched_treatment_zips, 1, 0),
+    group = ifelse(treated == 1, "Treated", "Control")
+  )
+
+```
+
+
+
+```{r study2-ptrends}
+#parallel trends
+
+#plot trends
+analysis_study2 %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated) %>%
+  summarise(
+    mean_ppv = mean(ppv_rate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated))) +
+  geom_line() +
+  geom_point()
+
+
+```
+
+```{r}
+
+#formal parallel trends test
+pre_model <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) | `Patient Zipcode`,
+  data = analysis_study2 %>% filter(`Discharge Year` < 2017),
+  cluster = ~`Patient Zipcode`
+)
+
+
+pre_model
+
+```
+
+
+
+Run event study for this
+```{r}
+#run event study for the overall dataset (no subsetting, cutting off years)
+
+library(fixest)
+#run event study model 
+
+event_model_study2overall <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_study2,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(event_model_study2overall)
+
+#plot it 
+iplot(
+  event_model_study2overall,
+  main = "Study 2: Event Study- Effect of Subway Expansion on PPV Rates (Overall)",
+  xlab = "Event Time",
+  ylab = "Effect (relative to 2016)",
+  ref.line = 0
+)
+
+```
+
+
+
+
+
+
+Next we examine heterogeneity within the sample, starting with income
+```{r heterogeneity_ofZIPS_INCOME}
+
+#look at income heterogeneity
+
+library(dplyr)
+#build diagnostic dataset from df.panel
+diagnostic_df <- panel %>%
+  mutate(`Patient Zipcode` = as.character(`Patient Zipcode`)) %>%
+  left_join(
+    acs_summary %>% mutate(zcta = as.character(zcta)),
+    by = c("Patient Zipcode" = "zcta")
+  )
+
+#define treatment 
+diagnostic_df <- diagnostic_df %>%
+  mutate(
+    treated = ifelse(`Patient Zipcode` %in% treatment_zips, 1, 0)
+  )
+
+
+#create bins (three bins)
+diagnostic_df <- diagnostic_df %>%
+  mutate(
+    income_bin = ntile(income_pre, 3),
+    income_bin = factor(income_bin, labels = c("Low", "Mid", "High"))
+  )
+
+#plot pretrends by income level
+diagnostic_df %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated, income_bin) %>%
+  summarise(mean_ppv = mean(ppv_rate), .groups = "drop") %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated), group = treated)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  labs(title = "Income-Based Parallel Trends") +
+  scale_color_manual(values = c("0" = "red", "1" = "blue")) +
+  facet_wrap(~ income_bin) +
+  labs(color = "Treated")+
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "white"))
+
+
+#formal stratified 
+pre_model_income <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) | `Patient Zipcode`,
+  data = diagnostic_df %>% 
+    filter(`Discharge Year` < 2017),
+  cluster = ~`Patient Zipcode`,
+  split = ~ income_bin
+)
+summary(pre_model_income)
+
+```
+
+
+closer look at the differences between the income brackets/ treated/not treated
+```{r}
+#calculate slop differences per bin
+slope_diff <- diagnostic_df %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Patient Zipcode`) %>%
+  summarise(
+    slope = coef(lm(ppv_rate ~ `Discharge Year`))[2],
+    treated = first(treated),
+    income_bin = first(income_bin),
+    .groups = "drop"
+  ) %>%
+  group_by(income_bin, treated) %>%
+  summarise(mean_slope = mean(slope), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = treated, values_from = mean_slope) %>%
+  mutate(
+    `0` = as.numeric(`0`),
+    `1` = as.numeric(`1`),
+    diff = `1` - `0`
+  )
+
+#plot it
+ggplot(slope_diff, aes(x = income_bin, y = diff, label = round(diff, 3))) +
+  geom_col() +
+  geom_text(vjust = -0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Pre-Treatment Slope Differences by Income Group",
+    x = "Income Group",
+    y = "Slope Difference (Treated - Control)"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+build map of low-med-high income zips (color by group)
+
+
+```{r}
+#build map
+library(dplyr)
+library(sf)
+library(ggplot2)
+
+# Define analysis sample ZIPs
+analysis_zips <- unique(c(matched_treatment_zips, matched_control_zips))
+
+# ZIP-level income + treatment
+zip_income_groups <- diagnostic_df %>%
+  select(`Patient Zipcode`, income_bin, treated) %>%
+  distinct() %>%
+  rename(MODZCTA = `Patient Zipcode`) %>%
+  mutate(
+    MODZCTA = as.character(MODZCTA),
+    treated_label = ifelse(treated == 1, "Treatment", "Control")
+  ) %>%
+  filter(MODZCTA %in% analysis_zips)
+
+# Full NYC map
+nyc_map <- zcta_sf %>%
+  mutate(MODZCTA = as.character(MODZCTA))
+
+# Analysis ZIPs only
+map_income <- nyc_map %>%
+  filter(MODZCTA %in% analysis_zips) %>%
+  left_join(zip_income_groups, by = "MODZCTA")
+
+ggplot() +
+  # Background NYC (all ZIPs)
+  geom_sf(
+    data = nyc_map,
+    fill = "grey90",
+    color = "white",
+    linewidth = 0.1
+  ) +
+  # Control + Treatment ZIPs (colored by income)
+  geom_sf(
+    data = map_income,
+    aes(fill = income_bin),
+    color = "grey40",
+    linewidth = 0.2
+  ) +
+  # Treatment ZIPs outlined
+  geom_sf(
+    data = map_income %>% filter(treated == 1),
+    fill = NA,
+    color = "black",
+    linewidth = 0.9
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Low" = "#1b9e77",
+      "Mid" = "#d95f02",
+      "High" = "#7570b3"
+    )
+  ) +
+  labs(
+    title = "Study 2 ZIP Codes by Income Group",
+    subtitle = "Treatment ZIPs outlined; controls shown without outline",
+    fill = "Income Group"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+```
+```{r eventmodel}
+
+sa_model <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_dfSuA,
+  cluster = ~`Patient Zipcode`
+)
+
+#results
+summary(sa_model)
+
+#plot
+iplot(
+  sa_model,
+  main = "Sun-Abraham Event Study",
+  xlab = "Event Time",
+  ylab = "Effect on Risk-Adjusted PPV Rate"
+)
+
+
+
+
+```
+
+
+
+Heterogeneity by distance
+
+
+compute centroid distance to ues
+```{r compute_dist_to_UES}
+
+library(sf)
+library(dplyr)
+
+# standardize both to same CRS HERE 
+ues_stops_proj <- st_transform(ues_stops, 2263)
+zcta_sf_proj   <- st_transform(zcta_sf, 2263)
+
+# ZIP centroids
+zcta_centroids <- st_centroid(zcta_sf_proj)
+
+# distance matrix
+dist_matrix <- st_distance(zcta_centroids, ues_stops_proj)
+
+# minimum distance
+zcta_centroids$dist_to_q <- apply(dist_matrix, 1, min)
+
+# keep ZIP ID + distance
+zip_distance <- zcta_centroids %>%
+  st_drop_geometry() %>%
+  transmute(
+    zcta = as.character(MODZCTA),
+    dist_to_q = as.numeric(dist_to_q),
+    dist_to_q_miles = as.numeric(dist_to_q) / 5280
+  )
+
+# merge onto diagnostic data
+diagnostic_df <- diagnostic_df %>%
+  mutate(`Patient Zipcode` = as.character(`Patient Zipcode`)) %>%
+  left_join(
+    zip_distance,
+    by = c("Patient Zipcode" = "zcta")
+  )
+
+# create distance bins
+diagnostic_df <- diagnostic_df %>%
+  mutate(
+    dist_bin = ntile(dist_to_q_miles, 3),
+    dist_bin = factor(dist_bin, labels = c("Near", "Mid", "Far"))
+  )
+
+summary(diagnostic_df$dist_to_q_miles)
+table(diagnostic_df$dist_bin, useNA = "ifany")
+
+```
+
+build map of binned distances (color = group)
+```{r map-dist}
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+# Define analysis sample ZIPs
+analysis_zips <- unique(c(matched_treatment_zips, matched_control_zips))
+
+# ZIP-level distance + treatment lookup
+zip_distance_groups <- diagnostic_df %>%
+  select(`Patient Zipcode`, dist_bin, treated) %>%
+  distinct() %>%
+  rename(MODZCTA = `Patient Zipcode`) %>%
+  mutate(MODZCTA = as.character(MODZCTA)) %>%
+  filter(MODZCTA %in% analysis_zips)
+
+# Full NYC map
+nyc_map <- zcta_sf %>%
+  mutate(MODZCTA = as.character(MODZCTA))
+
+# Analysis ZIPs only
+map_distance <- nyc_map %>%
+  filter(MODZCTA %in% analysis_zips) %>%
+  left_join(zip_distance_groups, by = "MODZCTA")
+
+# Plot: only treatment/control colored, treatment outlined
+ggplot() +
+  # Background NYC
+  geom_sf(
+    data = nyc_map,
+    fill = "grey90",
+    color = "white",
+    linewidth = 0.1
+  ) +
+  # Analysis ZIPs colored by distance bin
+  geom_sf(
+    data = map_distance,
+    aes(fill = dist_bin),
+    color = "grey40",
+    linewidth = 0.2
+  ) +
+  # Treatment ZIPs outlined
+  geom_sf(
+    data = map_distance %>% filter(treated == 1),
+    fill = NA,
+    color = "black",
+    linewidth = 0.9
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Near" = "#1b9e77",
+      "Mid" = "#d95f02",
+      "Far" = "#7570b3"
+    )
+  ) +
+  labs(
+    title = "Study 2 ZIP Codes by Distance Group",
+    subtitle = "Treatment ZIPs outlined; controls shown without outline",
+    fill = "Distance Group"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+
+
+```
+
+
+```{r dist_hetero_plot}
+#plot
+diagnostic_df %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated, dist_bin) %>%
+  summarise(mean_ppv = mean(ppv_rate), .groups = "drop") %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated), group = treated)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  labs(title = "Distance-Based Parallel Trends") +
+  scale_color_manual(values = c("0" = "red", "1" = "blue")) +
+  facet_wrap(~ dist_bin) +
+  labs(color = "Treated")+
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "white"))
+
+
+
+```
+Looks like for near and mid zips, the trajectory becomes more parallel after 2014, while for far zips, they diverge pretty significantly at 2016. 
+
+
+
+```{r distformaltest}
+
+#formal test for dist
+pre_model_dist <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) | `Patient Zipcode`,
+  data = diagnostic_df %>% filter(`Discharge Year` < 2017),
+  cluster = ~`Patient Zipcode`,
+  split = ~ dist_bin
+)
+
+summary(pre_model_dist)
+
+```
+
+```{r dist_slopes}
+
+#compute slopes per zip
+slope_dist <- diagnostic_df %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Patient Zipcode`) %>%
+  summarise(
+    slope = coef(lm(ppv_rate ~ `Discharge Year`))[2],
+    treated = first(treated),
+    dist_bin = first(dist_bin),
+    .groups = "drop"
+  )
+
+
+#avg slopes by group
+slope_summary_dist <- slope_dist %>%
+  group_by(dist_bin, treated) %>%
+  summarise(mean_slope = mean(slope), .groups = "drop") %>%
+  pivot_wider(names_from = treated, values_from = mean_slope) %>%
+  mutate(
+    `0` = as.numeric(`0`),
+    `1` = as.numeric(`1`),
+    diff = `1` - `0`
+  )
+
+slope_summary_dist
+
+#plot slope differences
+ggplot(slope_summary_dist, aes(x = dist_bin, y = diff, label = round(diff, 3))) +
+  geom_col() +
+  geom_text(vjust = -0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Pre-Treatment Slope Differences by Distance",
+    x = "Distance Group",
+    y = "Slope Difference (Treated - Control)"
+  ) +
+  theme_minimal()
+
+
+```
+
+Since there were clear signs of trends for certain groups becoming more parallel post 2013, and signs of near zips not being parallel at all, we're going to restrict to comparable geographic areas and stable pre-periods (eg. post 2013, old far and mid zips distance-wise)- testing increased access
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+
+# restrict sample: drop Near + keep later pre-period
+analysis_df_final <- diagnostic_df %>%
+  filter(
+    dist_bin != "Near",
+    `Discharge Year` >= 2013,
+    `Discharge Year` < 2017   # keep pre-treatment only
+  )
+
+# create pre-trend plot
+analysis_df_final %>%
+  group_by(`Discharge Year`, treated, dist_bin) %>%
+  summarise(mean_ppv = mean(ppv_rate, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated))) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ dist_bin) +
+  labs(
+    title = "Pre-Treatment Trends (Restricted Sample: Mid & Far, 2013–2016)",
+    x = "Discharge Time",
+    y = "Mean PPV Rate",
+    color = "Treated"
+  ) +
+  theme_minimal()
+
+
+```
+
+Use far only as controls? EG: compare treated ZIPs to geographically distant ZIPs that exhibit similar pre-treatment trends
+```{r}
+
+analysis_df_far <- diagnostic_df %>%
+  filter(
+    dist_bin == "Far" | treated == 1,   # keep all treated + far controls
+    `Discharge Year` >= 2013
+  )%>%
+  mutate(
+    group = ifelse(treated == 1, "Treated", "Control"),
+    post = ifelse(`Discharge Year` >= 2017, 1, 0),
+    treat_year = ifelse(treated == 1, 2017, 0)
+  )
+
+# Quick check
+analysis_df_far %>%
+  count(treated, dist_bin)
+
+
+#Pre-trend plot
+
+analysis_df_far %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated) %>%
+  summarise(
+    mean_ppv = mean(ppv_rate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated))) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Pre-Treatment Trends: Treated ZIPs vs Far Controls (2013–2016)",
+    x = "Discharge Time",
+    y = "Mean PPV Rate",
+    color = "Treated"
+  ) +
+  theme_minimal()
+
+#formal pretrend test
+pre_model_far <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) | `Patient Zipcode`,
+  data = analysis_df_far %>% filter(`Discharge Year` < 2017),
+  cluster = ~`Patient Zipcode`
+)
+
+summary(pre_model_far)
+
+
+```
+
+Run DiD model 
+```{r}
+
+did_model_far <- feols(
+  ppv_rate ~ treated * post | `Patient Zipcode` + `Discharge Year`,
+  data = analysis_df_far,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(did_model_far)
+
+
+```
+DEEPLY insignificant results lmao 
+
+Event study DiD
+```{r}
+library(fixest)
+#run event study model 
+event_model_far <- feols(
+  ppv_rate ~ i(`Discharge Year`, treated, ref = 2016) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_df_far,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(event_model_far)
+
+#plot it 
+iplot(
+  event_model_far,
+  main = "Event Study: Effect of Subway Expansion on PPV Rates",
+  xlab = "Event Time",
+  ylab = "Effect (relative to 2016)",
+  ref.line = 0
+)
+
+
+#much smaller confidence intervals in pre-period vs post
+# might be an issue with the data, choice of control 
+```
+
+
+```{r study2-SUNAB}
+#sunab for far zips
+sa_study2 <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_df_far,
+  cluster = ~`Patient Zipcode`
+)
+
+
+summary(sa_study2)
+
+iplot(
+  sa_study2,
+  main = "Sun-Ab Event Study (Study 2): Effect of Subway Expansion on PPV Rates (far zip codes)",
+  xlab = "Year",
+  ylab = "Effect (relative to 2016)",
+  ref.line = 0
+)
+
+#significant for first year after intervention, then drops down to year 0 levels (not sustained effect)
+#transitory effect
+
+```
+
+
+
+
+
+
+Restrict sample in different ways (run with near + 2013-2022)
+```{r}
+#NEAR ZIPS (Exclude 2011-2012)
+#pretrend + DiD 
+library(ggplot2)
+library(dplyr)
+library(fixest)
+
+# Build analysis sample
+analysis_near <- diagnostic_df %>%
+  filter(
+    `Discharge Year` >= 2013,
+    `Discharge Year` <= 2022,
+    `Patient Zipcode` %in% c(matched_treatment_zips, matched_control_zips)
+  ) %>%
+  mutate(
+    post = ifelse(`Discharge Year` >= 2017, 1, 0), 
+    treat_year = ifelse(treated == 1, 2017, 0)
+  )
+
+# Quick sanity checks
+analysis_near %>% count(treated)
+analysis_near %>% count(`Discharge Year`)
+
+# Run DiD
+did_near <- feols(
+  ppv_rate ~ treated * post | `Patient Zipcode` + `Discharge Year`,
+  data = analysis_near,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(did_near)
+
+analysis_near %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated) %>%
+  summarise(mean_ppv = mean(ppv_rate, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated))) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Pre-Treatment Trends (Near + All Bins, 2013–2016)",
+    color = "Treated"
+  ) +
+  theme_minimal()
+
+
+#run sunab model on near zips
+
+#event study
+nearzips_eventmodel <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_near,
+  cluster = ~`Patient Zipcode`
+)
+
+#results
+summary(nearzips_eventmodel)
+
+#plot
+iplot(
+  nearzips_eventmodel,
+  main = "Near ZIPs: Sun-Ab Event Study",
+  xlab = "Event Time",
+  ylab = "Effect on Risk-Adjusted PPV Rate"
+)
+
+
+
+
+
+
+```
+
+
+run by income 
+-  just low income
+-  just high income 
+```{r}
+#high income 
+
+library(dplyr)
+library(fixest)
+
+# Build sample
+analysis_high <- diagnostic_df %>%
+  filter(
+    `Discharge Year` >= 2013,
+    `Discharge Year` <= 2022,
+    `Patient Zipcode` %in% c(matched_treatment_zips, matched_control_zips),
+    income_bin == "High"
+  ) %>%
+  mutate(
+    post = ifelse(`Discharge Year` >= 2017, 1, 0),
+    treat_year = ifelse(treated == 1, 2017, 0)
+  )
+
+# Sanity checks
+analysis_high %>% count(treated)
+analysis_high %>% count(`Discharge Year`)
+
+# Run DiD
+did_high <- feols(
+  ppv_rate ~ treated:post | `Patient Zipcode` + `Discharge Year`,
+  data = analysis_high,
+  cluster = ~`Patient Zipcode`)
+
+summary(did_high)
+
+#pretrend
+analysis_high %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated) %>%
+  summarise(mean_ppv = mean(ppv_rate, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated))) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Pre-Treatment Trends (High-Income ZIPs, 2013–2016)",
+    color = "Treated"
+  ) +
+  theme_minimal()
+
+
+#sunab event study
+highinc_eventmodel <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_high,
+  cluster = ~`Patient Zipcode`
+)
+
+#results
+summary(highinc_eventmodel)
+
+#plot
+iplot(
+  highinc_eventmodel,
+  main = "High Income ZIPs: Sun-Ab Event Study",
+  xlab = "Event Time",
+  ylab = "Effect on Risk-Adjusted PPV Rate"
+)
+
+
+```
+```{r}
+#low income
+library(dplyr)
+library(fixest)
+
+# Build sample
+analysis_low <- diagnostic_df %>%
+  filter(
+    `Discharge Year` >= 2013,
+    `Discharge Year` <= 2022,
+    `Patient Zipcode` %in% c(matched_treatment_zips, matched_control_zips),
+    income_bin == "Low"
+  ) %>%
+  mutate(
+    post = ifelse(`Discharge Year` >= 2017, 1, 0),
+    treat_year = ifelse(treated == 1, 2017, 0)
+
+  )
+
+# Sanity checks
+analysis_low %>% count(treated)
+analysis_low %>% count(`Discharge Year`)
+
+# Run DiD
+did_low <- feols(
+  ppv_rate ~ treated * post | `Patient Zipcode` + `Discharge Year`,
+  data = analysis_low,
+  cluster = ~`Patient Zipcode`
+)
+
+summary(did_low)
+
+#pretrend
+analysis_low %>%
+  filter(`Discharge Year` < 2017) %>%
+  group_by(`Discharge Year`, treated) %>%
+  summarise(mean_ppv = mean(ppv_rate, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(`Discharge Year`, mean_ppv, color = factor(treated))) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Pre-Treatment Trends (Low-Income ZIPs, 2013–2016)",
+    color = "Treated"
+  ) +
+  theme_minimal()
+
+#low inc event study
+low_inc_eventmodel <- feols(
+  ppv_rate ~ sunab(treat_year, `Discharge Year`) |
+    `Patient Zipcode` + `Discharge Year`,
+  data = analysis_low,
+  cluster = ~`Patient Zipcode`
+)
+
+#results
+summary(low_inc_eventmodel)
+
+#plot
+iplot(
+  low_inc_eventmodel,
+  main = "Low Income ZIPs: Sun-Ab Event Study",
+  xlab = "Event Time",
+  ylab = "Effect on Risk-Adjusted PPV Rate"
+)
+
+
+```
+
