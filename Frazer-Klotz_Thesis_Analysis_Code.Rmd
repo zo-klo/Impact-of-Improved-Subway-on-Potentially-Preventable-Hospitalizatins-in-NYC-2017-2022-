@@ -14,7 +14,7 @@ library(fixest)
 
 getwd()
 #insert your own working directory 
-setwd("/Users/zo/Desktop/MAthesis_data")
+setwd([YOUR WORKING DIRECTORY])
 
 #load data
 Hospital_ER_DF <- read_csv("Hospital_Emergency_Department_Discharges_(SPARCS_De-Identified)__Potentially_Preventable_Emergency_Visit_(PPV)_Rates_by_Patient_Zip_Code__Beginning_2011_20260322.csv")
